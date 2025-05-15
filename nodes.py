@@ -19,12 +19,20 @@ import numpy as np
 from einops import rearrange
 import ast
 
+import nodes
+import torch
+import numpy as np
+from einops import rearrange
+import comfy.model_management
+
+
 # PIL to Tensor
 def pil2tensor(image):
   return torch.from_numpy(np.array(image.convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
 # Tensor to PIL
 def tensor2pil(image):
     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+
 def decode_to_image(encoding):
     if encoding.startswith("http://") or encoding.startswith("https://"):
         raise NotImplementedError
@@ -93,21 +101,228 @@ def decode_to_video(encoding):
     else:
         raise Exception(f'VideoAcc_LoadImage, not a  valid input format ==> {type(encoding), encoding}')
 
-CAMERA_dict = {
-    # T
-    "base_T_norm": 1.5,
-    "base_angle": np.pi/3,
+MAX_RESOLUTION = nodes.MAX_RESOLUTION
 
-    "Static": {     "angle":[0., 0., 0.],   "T":[0., 0., 0.]},
-    "Pan Up": {     "angle":[0., 0., 0.],   "T":[0., 1., 0.]},
-    "Pan Down": {   "angle":[0., 0., 0.],   "T":[0.,-1.,0.]},
-    "Pan Left": {   "angle":[0., 0., 0.],   "T":[1.,0.,0.]},
-    "Pan Right": {  "angle":[0., 0., 0.],   "T": [-1.,0.,0.]},
-    "Zoom In": {    "angle":[0., 0., 0.],   "T": [0.,0.,-2.]},
-    "Zoom Out": {   "angle":[0., 0., 0.],   "T": [0.,0.,2.]},
-    "ACW": {        "angle": [0., 0., 1.],  "T":[0., 0., 0.]},
-    "CW": {         "angle": [0., 0., -1.], "T":[0., 0., 0.]},
+
+CAMERA_DICT = {
+    "base_T_norm": 0.4,              # Translation scale factor
+    "base_angle": np.pi / 6,         # Rotation scale factor (60 degrees)
+
+    # ─── Static ───
+    "Static": {
+        "angle": [0., 0., 0.],       # No rotation
+        "T":     [0., 0., 0.]        # No translation
+    },
+
+    # ─── Rotations (Euler angles: Pitch=X, Yaw=Y, Roll=Z) ───
+    "Tilt Up":       { "angle": [1., 0., 0.],  "T": [0., 0., 0.] },  # Pitch up
+    "Tilt Down":     { "angle": [-1., 0., 0.], "T": [0., 0., 0.] },  # Pitch down
+    "Pan Left":      { "angle": [0., 1., 0.],  "T": [0., 0., 0.] },  # Yaw left
+    "Pan Right":     { "angle": [0., -1., 0.], "T": [0., 0., 0.] },  # Yaw right
+    "Roll Left":     { "angle": [0., 0., 1.],  "T": [0., 0., 0.] },  # Roll counter-clockwise
+    "Roll Right":    { "angle": [0., 0., -1.], "T": [0., 0., 0.] },  # Roll clockwise
+
+    # ─── Translations (world space movement) ───
+    "Truck Left":    { "angle": [0., 0., 0.],  "T": [-1., 0., 0.] },  # Move left
+    "Truck Right":   { "angle": [0., 0., 0.],  "T": [1., 0., 0.] },   # Move right
+    "Crane Up":      { "angle": [0., 0., 0.],  "T": [0., 1., 0.] },   # Move up
+    "Crane Down":    { "angle": [0., 0., 0.],  "T": [0., -1., 0.] },  # Move down
+    "Dolly In":      { "angle": [0., 0., 0.],  "T": [0., 0., 2.] },   # Move forward
+    "Dolly Out":     { "angle": [0., 0., 0.],  "T": [0., 0., -2.] },  # Move backward
+
+    # ─── Zoom (handled via fx/fy scaling in code) ───
+    "Zoom In":       { "angle": [0., 0., 0.],  "T": [0., 0., 0.] },
+    "Zoom Out":      { "angle": [0., 0., 0.],  "T": [0., 0., 0.] },
 }
+
+def process_pose_params(cam_params, width=672, height=384, original_pose_width=1280, original_pose_height=720, device='cpu'):
+
+    def get_relative_pose(cam_params):
+        """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
+        """
+        abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
+        abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
+        cam_to_origin = 0
+        target_cam_c2w = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, -cam_to_origin],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        abs2rel = target_cam_c2w @ abs_w2cs[0]
+        ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
+        ret_poses = np.array(ret_poses, dtype=np.float32)
+        return ret_poses
+
+    """Modified from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
+    """
+    cam_params = [Camera(cam_param) for cam_param in cam_params]
+
+    sample_wh_ratio = width / height
+    pose_wh_ratio = original_pose_width / original_pose_height  # Assuming placeholder ratios, change as needed
+
+    if pose_wh_ratio > sample_wh_ratio:
+        resized_ori_w = height * pose_wh_ratio
+        for cam_param in cam_params:
+            cam_param.fx = resized_ori_w * cam_param.fx / width
+    else:
+        resized_ori_h = width / pose_wh_ratio
+        for cam_param in cam_params:
+            cam_param.fy = resized_ori_h * cam_param.fy / height
+
+    intrinsic = np.asarray([[cam_param.fx * width,
+                            cam_param.fy * height,
+                            cam_param.cx * width,
+                            cam_param.cy * height]
+                            for cam_param in cam_params], dtype=np.float32)
+
+    K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
+    c2ws = get_relative_pose(cam_params)  # Assuming this function is defined elsewhere
+    c2ws = torch.as_tensor(c2ws)[None]  # [1, n_frame, 4, 4]
+    plucker_embedding = ray_condition(K, c2ws, height, width, device=device)[0].permute(0, 3, 1, 2).contiguous()  # V, 6, H, W
+    plucker_embedding = plucker_embedding[None]
+    plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b f h w c")[0]
+    return plucker_embedding
+
+class Camera(object):
+    """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
+    """
+    def __init__(self, entry):
+        fx, fy, cx, cy = entry[1:5]
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        c2w_mat = np.array(entry[7:]).reshape(4, 4)
+        self.c2w_mat = c2w_mat
+        self.w2c_mat = np.linalg.inv(c2w_mat)
+
+def ray_condition(K, c2w, H, W, device):
+    """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
+    """
+    # c2w: B, V, 4, 4
+    # K: B, V, 4
+
+    B = K.shape[0]
+
+    j, i = torch.meshgrid(
+        torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
+        torch.linspace(0, W - 1, W, device=device, dtype=c2w.dtype),
+        indexing='ij'
+    )
+    i = i.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
+    j = j.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
+
+    fx, fy, cx, cy = K.chunk(4, dim=-1)  # B,V, 1
+
+    zs = torch.ones_like(i)  # [B, HxW]
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    zs = zs.expand_as(ys)
+
+    directions = torch.stack((xs, ys, zs), dim=-1)  # B, V, HW, 3
+    directions = directions / directions.norm(dim=-1, keepdim=True)  # B, V, HW, 3
+
+    rays_d = directions @ c2w[..., :3, :3].transpose(-1, -2)  # B, V, 3, HW
+    rays_o = c2w[..., :3, 3]  # B, V, 3
+    rays_o = rays_o[:, :, None].expand_as(rays_d)  # B, V, 3, HW
+    # c2w @ dirctions
+    rays_dxo = torch.cross(rays_o, rays_d)
+    plucker = torch.cat([rays_dxo, rays_d], dim=-1)
+    plucker = plucker.reshape(B, c2w.shape[1], H, W, 6)  # B, V, H, W, 6
+    # plucker = plucker.permute(0, 1, 4, 2, 3)
+    return plucker
+
+def get_camera_motion(angle, T, speed, n=81, speed_type = "steady", initial_angle=(0., 0., 0.), initial_location=(0., 0., 0.)):
+    def compute_R_form_rad_angle(angles):
+        theta_x, theta_y, theta_z = angles
+        Rx = np.array([[1, 0, 0],
+                    [0, np.cos(theta_x), -np.sin(theta_x)],
+                    [0, np.sin(theta_x), np.cos(theta_x)]])
+
+        Ry = np.array([[np.cos(theta_y), 0, np.sin(theta_y)],
+                    [0, 1, 0],
+                    [-np.sin(theta_y), 0, np.cos(theta_y)]])
+
+        Rz = np.array([[np.cos(theta_z), -np.sin(theta_z), 0],
+                    [np.sin(theta_z), np.cos(theta_z), 0],
+                    [0, 0, 1]])
+
+        R = np.dot(Rz, np.dot(Ry, Rx))
+        return R
+    RT = []
+
+
+    initial_R = compute_R_form_rad_angle(initial_angle)
+    initial_T = np.array(initial_location).reshape(3, 1)
+
+    for i in range(n):
+        if speed_type == "steady":
+            speed_factor = 1.0
+        elif speed_type == "accelerate":
+            speed_factor = 1.0 + (i / n) * 1.0
+        else:
+            speed_factor = 2.0 - (i / n) * 1.0
+
+        _angle = (i/n)*speed_factor*speed*(CAMERA_DICT["base_angle"])*angle
+        delta_R = compute_R_form_rad_angle(_angle)
+        _T=(i/n)*speed_factor*speed*(CAMERA_DICT["base_T_norm"])*(T.reshape(3,1))
+
+        # Compose final RT with initial
+        R = delta_R @ initial_R
+        T_total = initial_T + _T
+
+        _RT = np.concatenate([R, T_total], axis=1)
+        RT.append(_RT)
+    RT = np.stack(RT)
+    return RT
+
+def create_orbit_path(n_frames, total_angle = 2.0, radius=3.0, center=np.array([0, 0, 0]), height=0.0):
+    extrinsics = []
+    for i in range(n_frames):
+        angle = total_angle* np.pi * i / n_frames
+        x = center[0] + radius * np.cos(angle)
+        z = center[2] + radius * np.sin(angle)
+        pos = np.array([x, height, z])
+        forward = (center - pos)
+        forward = forward / np.linalg.norm(forward)
+        up = np.array([0, 1, 0])
+        right = np.cross(up, forward)
+        right = right / np.linalg.norm(right)
+        up = np.cross(forward, right)
+        R = np.stack([right, up, forward], axis=1)
+        RT = np.eye(4)
+        RT[:3, :3] = R
+        RT[:3, 3] = pos
+        extrinsics.append(RT)
+    return np.stack(extrinsics)
+
+def create_dolly_zoom_path(n_frames, start_pos, end_pos, look_at=np.array([0, 0, 0])):
+    positions = np.linspace(start_pos, end_pos, n_frames)
+    extrinsics = []
+    for pos in positions:
+        forward = (look_at - pos)
+        forward = forward / np.linalg.norm(forward)
+        up = np.array([0, 1, 0])
+        right = np.cross(up, forward)
+        right = right / np.linalg.norm(right)
+        up = np.cross(forward, right)
+        R = np.stack([right, up, forward], axis=1)
+        RT = np.eye(4)
+        RT[:3, :3] = R
+        RT[:3, 3] = pos
+        extrinsics.append(RT)
+    return np.stack(extrinsics)
+
+def parse_matrix(matrix_str):
+    rows = matrix_str.strip().split('] [')
+    matrix = []
+    for row in rows:
+        row = row.replace('[', '').replace(']', '')
+        matrix.append(list(map(float, row.split())))
+    return np.array(matrix)
+
+
 
 class VideoAcc_LoadImage:
     @classmethod
@@ -436,7 +651,7 @@ class VideoAcc_CameraTrajectoryRecam:
         }
 
     RETURN_TYPES = ("LATENT","INT","INT","INT")
-    RETURN_NAMES = ("camera_embedding","width","height","length")
+    RETURN_NAMES = ("WAN_CAMERA_EMBEDDING","width","height","length")
     FUNCTION = "run"
     CATEGORY = "CameraCtrl"
 
@@ -447,119 +662,6 @@ class VideoAcc_CameraTrajectoryRecam:
         Translate Up (with rotation), Translate Down (with rotation), Arc Left (with rotation), Arc Right (with rotation)
         https://github.com/KwaiVGI/ReCamMaster
         """
-        def ray_condition(K, c2w, H, W, device):
-            def custom_meshgrid(*args):
-                from packaging import version as pver
-                """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-                """
-                # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
-                if pver.parse(torch.__version__) < pver.parse('1.10'):
-                    return torch.meshgrid(*args)
-                else:
-                    return torch.meshgrid(*args, indexing='ij')
-            """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-            """
-            # c2w: B, V, 4, 4
-            # K: B, V, 4
-
-            B = K.shape[0]
-
-            j, i = custom_meshgrid(
-                torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
-                torch.linspace(0, W - 1, W, device=device, dtype=c2w.dtype),
-            )
-            i = i.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
-            j = j.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
-
-            fx, fy, cx, cy = K.chunk(4, dim=-1)  # B,V, 1
-
-            zs = torch.ones_like(i)  # [B, HxW]
-            xs = (i - cx) / fx * zs
-            ys = (j - cy) / fy * zs
-            zs = zs.expand_as(ys)
-
-            directions = torch.stack((xs, ys, zs), dim=-1)  # B, V, HW, 3
-            directions = directions / directions.norm(dim=-1, keepdim=True)  # B, V, HW, 3
-
-            rays_d = directions @ c2w[..., :3, :3].transpose(-1, -2)  # B, V, 3, HW
-            rays_o = c2w[..., :3, 3]  # B, V, 3
-            rays_o = rays_o[:, :, None].expand_as(rays_d)  # B, V, 3, HW
-            # c2w @ dirctions
-            rays_dxo = torch.cross(rays_o, rays_d)
-            plucker = torch.cat([rays_dxo, rays_d], dim=-1)
-            plucker = plucker.reshape(B, c2w.shape[1], H, W, 6)  # B, V, H, W, 6
-            # plucker = plucker.permute(0, 1, 4, 2, 3)
-            return plucker
-
-        def process_pose_params(cam_params, width=672, height=384, original_pose_width=1280, original_pose_height=720, device='cpu'):
-            class Camera(object):
-                """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-                """
-                def __init__(self, entry):
-                    fx, fy, cx, cy = entry[1:5]
-                    self.fx = fx
-                    self.fy = fy
-                    self.cx = cx
-                    self.cy = cy
-                    c2w_mat = np.array(entry[7:]).reshape(4, 4)
-                    self.c2w_mat = c2w_mat
-                    self.w2c_mat = np.linalg.inv(c2w_mat)
-
-            def get_relative_pose(cam_params):
-                """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-                """
-                abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
-                abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
-                cam_to_origin = 0
-                target_cam_c2w = np.array([
-                    [1, 0, 0, 0],
-                    [0, 1, 0, -cam_to_origin],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1]
-                ])
-                abs2rel = target_cam_c2w @ abs_w2cs[0]
-                ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
-                ret_poses = np.array(ret_poses, dtype=np.float32)
-                return ret_poses
-
-            """Modified from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-            """
-            cam_params = [Camera(cam_param) for cam_param in cam_params]
-
-            sample_wh_ratio = width / height
-            pose_wh_ratio = original_pose_width / original_pose_height  # Assuming placeholder ratios, change as needed
-
-            if pose_wh_ratio > sample_wh_ratio:
-                resized_ori_w = height * pose_wh_ratio
-                for cam_param in cam_params:
-                    cam_param.fx = resized_ori_w * cam_param.fx / width
-            else:
-                resized_ori_h = width / pose_wh_ratio
-                for cam_param in cam_params:
-                    cam_param.fy = resized_ori_h * cam_param.fy / height
-
-            intrinsic = np.asarray([[cam_param.fx * width,
-                                    cam_param.fy * height,
-                                    cam_param.cx * width,
-                                    cam_param.cy * height]
-                                    for cam_param in cam_params], dtype=np.float32)
-
-            K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
-            c2ws = get_relative_pose(cam_params)  # Assuming this function is defined elsewhere
-            c2ws = torch.as_tensor(c2ws)[None]  # [1, n_frame, 4, 4]
-            plucker_embedding = ray_condition(K, c2ws, height, width, device=device)[0].permute(0, 3, 1, 2).contiguous()  # V, 6, H, W
-            plucker_embedding = plucker_embedding[None]
-            plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b f h w c")[0]
-            return plucker_embedding
-
-        def parse_matrix(matrix_str):
-            rows = matrix_str.strip().split('] [')
-            matrix = []
-            for row in rows:
-                row = row.replace('[', '').replace(']', '')
-                matrix.append(list(map(float, row.split())))
-            return np.array(matrix)
-
         file_path = __file__
         folder_path = os.path.dirname(file_path)
         tgt_camera_path = os.path.join(folder_path,"camera_extrinsics.json")
@@ -613,9 +715,9 @@ class VideoAcc_CameraTrajectoryAdvance:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "camera_pose":(["Static","Pan Up","Pan Down","Pan Left","Pan Right","Zoom In","Zoom Out","ACW","CW","orbit","dolly_zoom"],{"default":"Static"}),
-                "fx":("FLOAT",{"default":0.474812461, "min": 0, "max": 1, "step": 0.000000001}),
-                "fy":("FLOAT",{"default":0.844111024, "min": 0, "max": 1, "step": 0.000000001}),
+                "camera_pose":([_ for _ in CAMERA_DICT],{"default":"Static"}),
+                "fx":("FLOAT",{"default":1.0, "min": 0, "max": 1, "step": 0.000000001}),
+                "fy":("FLOAT",{"default":1.0, "min": 0, "max": 1, "step": 0.000000001}),
                 "cx":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.01}),
                 "cy":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.01}),
                 "width": ("INT", {"default": 832, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
@@ -625,201 +727,39 @@ class VideoAcc_CameraTrajectoryAdvance:
             "optional":{
                 "speed":("FLOAT",{"default":1.0, "min": 0, "max": 10.0, "step": 0.1}),
                 "speed_type":(["steady", "accelerate", "decelerate"],{"default":"steady"}),
-                "start_position":("STRING", {"default":"[0, 1, -6]"}),
-                "end_position":("STRING", {"default":"[0, 1, -2]"}),
-                "total_angle":("FLOAT",{"default":2.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "initial_angle": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),  # Euler angles in radians
+                "initial_location": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),  # XYZ coordinates
+                "zoom_factor":("FLOAT",{"default":0, "min": -1, "max": 1, "step": 0.01}),
             }
 
         }
 
-    RETURN_TYPES = ("LATENT","INT","INT","INT")
+    RETURN_TYPES = ("WAN_CAMERA_EMBEDDING","INT","INT","INT")
     RETURN_NAMES = ("camera_embedding","width","height","length")
     FUNCTION = "run"
     CATEGORY = "CameraCtrl"
 
-    def run(self, camera_pose, fx, fy, cx, cy, width, height, length, speed=1.0, speed_type="steady", start_position="[0, 1, -6]", end_position="[0, 1, -2]", total_angle=2.0):
+    def run(self, camera_pose, fx, fy, cx, cy, width, height, length, speed=1.0, speed_type="steady", initial_angle="[0.0, 0.0, 0.0]", initial_location="[0.0, 0.0, 0.0]",  zoom_factor=1.0):
         """
         Use Camera trajectory as extrinsic parameters from ReCamMaster to calculate Plücker embeddings (Sitzmannet al., 2021)
         index from 1 to 10 represent: Pan Right, Pan Left, Tilt Up, Tilt Down, Zoom In, Zoom Out;
         Translate Up (with rotation), Translate Down (with rotation), Arc Left (with rotation), Arc Right (with rotation)
         https://github.com/KwaiVGI/ReCamMaster
         """
-        def get_camera_motion(angle, T, speed, n=81):
-            def compute_R_form_rad_angle(angles):
-                theta_x, theta_y, theta_z = angles
-                Rx = np.array([[1, 0, 0],
-                            [0, np.cos(theta_x), -np.sin(theta_x)],
-                            [0, np.sin(theta_x), np.cos(theta_x)]])
-                
-                Ry = np.array([[np.cos(theta_y), 0, np.sin(theta_y)],
-                            [0, 1, 0],
-                            [-np.sin(theta_y), 0, np.cos(theta_y)]])
-                
-                Rz = np.array([[np.cos(theta_z), -np.sin(theta_z), 0],
-                            [np.sin(theta_z), np.cos(theta_z), 0],
-                            [0, 0, 1]])
-                
-                R = np.dot(Rz, np.dot(Ry, Rx))
-                return R
-            RT = []
-            for i in range(n):
-                if speed_type == "steady":
-                    speed_latest =  speed
-                elif speed_type == "accelerate":
-                    speed_latest =  speed * (i/n + 0.5)
-                else:
-                    speed_latest =  speed * (1.5 - i/n)
-                _angle = (i/n)*speed_latest*(CAMERA_dict["base_angle"])*angle
-                R = compute_R_form_rad_angle(_angle)
-                _T=(i/n)*speed_latest*(CAMERA_dict["base_T_norm"])*(T.reshape(3,1))
-                _RT = np.concatenate([R,_T], axis=1)
-                RT.append(_RT)
-            RT = np.stack(RT)
-            return RT
-
-        def ray_condition(K, c2w, H, W, device):
-            """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-            """
-            # c2w: B, V, 4, 4
-            # K: B, V, 4
-
-            B = K.shape[0]
-
-            j, i = torch.meshgrid(
-                torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
-                torch.linspace(0, W - 1, W, device=device, dtype=c2w.dtype), 
-                indexing='ij'
-            )
-            i = i.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
-            j = j.reshape([1, 1, H * W]).expand([B, 1, H * W]) + 0.5  # [B, HxW]
-
-            fx, fy, cx, cy = K.chunk(4, dim=-1)  # B,V, 1
-
-            zs = torch.ones_like(i)  # [B, HxW]
-            xs = (i - cx) / fx * zs
-            ys = (j - cy) / fy * zs
-            zs = zs.expand_as(ys)
-
-            directions = torch.stack((xs, ys, zs), dim=-1)  # B, V, HW, 3
-            directions = directions / directions.norm(dim=-1, keepdim=True)  # B, V, HW, 3
-
-            rays_d = directions @ c2w[..., :3, :3].transpose(-1, -2)  # B, V, 3, HW
-            rays_o = c2w[..., :3, 3]  # B, V, 3
-            rays_o = rays_o[:, :, None].expand_as(rays_d)  # B, V, 3, HW
-            # c2w @ dirctions
-            rays_dxo = torch.cross(rays_o, rays_d)
-            plucker = torch.cat([rays_dxo, rays_d], dim=-1)
-            plucker = plucker.reshape(B, c2w.shape[1], H, W, 6)  # B, V, H, W, 6
-            # plucker = plucker.permute(0, 1, 4, 2, 3)
-            return plucker
-
-        def process_pose_params(cam_params, width=672, height=384, original_pose_width=1280, original_pose_height=720, device='cpu'):
-            class Camera(object):
-                """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-                """
-                def __init__(self, entry):
-                    fx, fy, cx, cy = entry[1:5]
-                    self.fx = fx
-                    self.fy = fy
-                    self.cx = cx
-                    self.cy = cy
-                    c2w_mat = np.array(entry[7:]).reshape(4, 4)
-                    self.c2w_mat = c2w_mat
-                    self.w2c_mat = np.linalg.inv(c2w_mat)
-
-            def get_relative_pose(cam_params):
-                """Copied from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-                """
-                abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
-                abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
-                cam_to_origin = 0
-                target_cam_c2w = np.array([
-                    [1, 0, 0, 0],
-                    [0, 1, 0, -cam_to_origin],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1]
-                ])
-                abs2rel = target_cam_c2w @ abs_w2cs[0]
-                ret_poses = [target_cam_c2w, ] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
-                ret_poses = np.array(ret_poses, dtype=np.float32)
-                return ret_poses
-
-            """Modified from https://github.com/hehao13/CameraCtrl/blob/main/inference.py
-            """
-            cam_params = [Camera(cam_param) for cam_param in cam_params]
-
-            sample_wh_ratio = width / height
-            pose_wh_ratio = original_pose_width / original_pose_height  # Assuming placeholder ratios, change as needed
-
-            if pose_wh_ratio > sample_wh_ratio:
-                resized_ori_w = height * pose_wh_ratio
-                for cam_param in cam_params:
-                    cam_param.fx = resized_ori_w * cam_param.fx / width
-            else:
-                resized_ori_h = width / pose_wh_ratio
-                for cam_param in cam_params:
-                    cam_param.fy = resized_ori_h * cam_param.fy / height
-
-            intrinsic = np.asarray([[cam_param.fx * width,
-                                    cam_param.fy * height,
-                                    cam_param.cx * width,
-                                    cam_param.cy * height]
-                                    for cam_param in cam_params], dtype=np.float32)
-
-            K = torch.as_tensor(intrinsic)[None]  # [1, 1, 4]
-            c2ws = get_relative_pose(cam_params)  # Assuming this function is defined elsewhere
-            c2ws = torch.as_tensor(c2ws)[None]  # [1, n_frame, 4, 4]
-            plucker_embedding = ray_condition(K, c2ws, height, width, device=device)[0].permute(0, 3, 1, 2).contiguous()  # V, 6, H, W
-            plucker_embedding = plucker_embedding[None]
-            plucker_embedding = rearrange(plucker_embedding, "b f c h w -> b f h w c")[0]
-            return plucker_embedding
-
-        def create_orbit_path(n_frames, total_angle = 2.0, radius=3.0, center=np.array([0, 0, 0]), height=0.0):
-            extrinsics = []
-            for i in range(n_frames):
-                angle = total_angle* np.pi * i / n_frames
-                x = center[0] + radius * np.cos(angle)
-                z = center[2] + radius * np.sin(angle)
-                pos = np.array([x, height, z])
-                forward = (center - pos)
-                forward = forward / np.linalg.norm(forward)
-                up = np.array([0, 1, 0])
-                right = np.cross(up, forward)
-                right = right / np.linalg.norm(right)
-                up = np.cross(forward, right)
-                R = np.stack([right, up, forward], axis=1)
-                RT = np.eye(4)
-                RT[:3, :3] = R
-                RT[:3, 3] = pos
-                extrinsics.append(RT)
-            return np.stack(extrinsics)
-
-        def create_dolly_zoom_path(n_frames, start_pos, end_pos, look_at=np.array([0, 0, 0])):
-            positions = np.linspace(start_pos, end_pos, n_frames)
-            extrinsics = []
-            for pos in positions:
-                forward = (look_at - pos)
-                forward = forward / np.linalg.norm(forward)
-                up = np.array([0, 1, 0])
-                right = np.cross(up, forward)
-                right = right / np.linalg.norm(right)
-                up = np.cross(forward, right)
-                R = np.stack([right, up, forward], axis=1)
-                RT = np.eye(4)
-                RT[:3, :3] = R
-                RT[:3, 3] = pos
-                extrinsics.append(RT)
-            return np.stack(extrinsics)
-
         if camera_pose in ["orbit","dolly_zoom"]:
-            start_position = np.array(ast.literal_eval(start_position))
-            end_position = np.array(ast.literal_eval(end_position))
+            pass
+            # start_position = np.array(ast.literal_eval(start_position))
+            # end_position = np.array(ast.literal_eval(end_position))
 
-            if camera_pose == "orbit":
-                RT = create_orbit_path(length, total_angle=total_angle,  radius=4.0, center=np.array([0, 1, 0]))
-            elif camera_pose == "dolly_zoom":
-                RT = create_dolly_zoom_path(length, start_position, end_position)
+            # if camera_pose == "orbit":
+            #     RT = create_orbit_path(length, total_angle=total_angle,  radius=4.0, center=np.array([0, 1, 0]))
+            # elif camera_pose == "dolly_zoom":
+            #     RT = create_dolly_zoom_path(length, start_position, end_position)
         else:
+            initial_angle = np.array(ast.literal_eval(initial_angle), dtype=np.float32)
+            initial_location = np.array(ast.literal_eval(initial_location), dtype=np.float32)
+
+
             camera_dict = {
                 "motion":[camera_pose],
                 "mode": "Basic Camera Poses",  # "First A then B", "Both A and B", "Custom"
@@ -828,12 +768,22 @@ class VideoAcc_CameraTrajectoryAdvance:
                 }
             motion_list = camera_dict['motion']
             speed = camera_dict['speed'] 
-            angle = np.array(CAMERA_dict[motion_list[0]]["angle"])
-            T = np.array(CAMERA_dict[motion_list[0]]["T"])
-            RT = get_camera_motion(angle, T, speed, length)
+            angle = np.array(CAMERA_DICT[motion_list[0]]["angle"])
+            T = np.array(CAMERA_DICT[motion_list[0]]["T"])
+            RT = get_camera_motion(angle, T, speed, length, speed_type=speed_type,
+                initial_angle=initial_angle,
+                initial_location=initial_location
+            )
         trajs=[]
-        for cp in RT.tolist():
-            traj=[fx,fy,cx,cy,0,0]
+        for i, cp in enumerate(RT.tolist()):
+            if camera_pose == "Zoom In":
+                scale = 1.0 + (i / length) * zoom_factor   # progressively zoom in to 130%
+            elif camera_pose == "Zoom Out":
+                scale = 1.0 - (i / length) * zoom_factor   # progressively zoom out to 70%
+            else:
+                scale = 1.0
+
+            traj=[scale * fx,scale * fy,cx,cy,0,0]
             traj.extend(cp[0])
             traj.extend(cp[1])
             traj.extend(cp[2])
@@ -879,6 +829,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoAcc_LoadVideo": 'VideoAcc Load Video(URL, Base64, Path)',
     "VideoAcc_ImageUpscaleVideo": 'VideoAcc upscale video',
     "VideoAcc_CameraTrajectoryRecam": "VideoAcc load default camera trajectory from ReCam",
-    "VideoAcc_CameraTrajectoryNew": "VideoAcc by new",
+    "VideoAcc_CameraTrajectoryAdvance": "VideoAcc Advanced Camera trajectory",
 }
 
