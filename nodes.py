@@ -18,6 +18,7 @@ from comfy.utils import ProgressBar, common_upscale
 import numpy as np
 from einops import rearrange
 import ast
+import copy
 
 import nodes
 import torch
@@ -277,42 +278,7 @@ def get_camera_motion(angle, T, speed, n=81, speed_type = "steady", initial_angl
     RT = np.stack(RT)
     return RT
 
-def create_orbit_path(n_frames, total_angle = 2.0, radius=3.0, center=np.array([0, 0, 0]), height=0.0):
-    extrinsics = []
-    for i in range(n_frames):
-        angle = total_angle* np.pi * i / n_frames
-        x = center[0] + radius * np.cos(angle)
-        z = center[2] + radius * np.sin(angle)
-        pos = np.array([x, height, z])
-        forward = (center - pos)
-        forward = forward / np.linalg.norm(forward)
-        up = np.array([0, 1, 0])
-        right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)
-        up = np.cross(forward, right)
-        R = np.stack([right, up, forward], axis=1)
-        RT = np.eye(4)
-        RT[:3, :3] = R
-        RT[:3, 3] = pos
-        extrinsics.append(RT)
-    return np.stack(extrinsics)
 
-def create_dolly_zoom_path(n_frames, start_pos, end_pos, look_at=np.array([0, 0, 0])):
-    positions = np.linspace(start_pos, end_pos, n_frames)
-    extrinsics = []
-    for pos in positions:
-        forward = (look_at - pos)
-        forward = forward / np.linalg.norm(forward)
-        up = np.array([0, 1, 0])
-        right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)
-        up = np.cross(forward, right)
-        R = np.stack([right, up, forward], axis=1)
-        RT = np.eye(4)
-        RT[:3, :3] = R
-        RT[:3, 3] = pos
-        extrinsics.append(RT)
-    return np.stack(extrinsics)
 
 def parse_matrix(matrix_str):
     rows = matrix_str.strip().split('] [')
@@ -322,7 +288,21 @@ def parse_matrix(matrix_str):
         matrix.append(list(map(float, row.split())))
     return np.array(matrix)
 
+def combine_camera_motion(RT_0, RT_1):
+    RT = copy.deepcopy(RT_0[-1])
+    R = RT[:,:3]
+    R_inv = RT[:,:3].T
+    T =  RT[:,-1]
 
+    temp = []
+    for _RT in RT_1:
+        _RT[:,:3] = np.dot(_RT[:,:3], R)
+        _RT[:,-1] =  _RT[:,-1] + np.dot(np.dot(_RT[:,:3], R_inv), T) 
+        temp.append(_RT)
+
+    RT_1 = np.stack(temp)
+
+    return np.concatenate([RT_0, RT_1], axis=0)
 
 class VideoAcc_LoadImage:
     @classmethod
@@ -715,7 +695,7 @@ class VideoAcc_CameraTrajectoryAdvance:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "camera_pose":([_ for _ in CAMERA_DICT],{"default":"Static"}),
+                "camera_pose":([_ for _ in CAMERA_DICT] + ["Customize"],{"default":"Static"}),
                 "fx":("FLOAT",{"default":1.0, "min": 0, "max": 1, "step": 0.000000001}),
                 "fy":("FLOAT",{"default":1.0, "min": 0, "max": 1, "step": 0.000000001}),
                 "cx":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.01}),
@@ -729,7 +709,13 @@ class VideoAcc_CameraTrajectoryAdvance:
                 "speed_type":(["steady", "accelerate", "decelerate"],{"default":"steady"}),
                 "initial_angle": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),  # Euler angles in radians
                 "initial_location": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),  # XYZ coordinates
-                "zoom_factor":("FLOAT",{"default":0, "min": -1, "max": 1, "step": 0.01}),
+                "zoom_factor":("FLOAT",{"default":0, "min": 0, "max": 1, "step": 0.01}),
+                "camera_pose_1":([_ for _ in CAMERA_DICT] + [""],{"default":""}),
+                "camera_pose_2":([_ for _ in CAMERA_DICT] + [""],{"default":""}),
+                "camera_pose_3":([_ for _ in CAMERA_DICT] + [""],{"default":""}),
+                "camera_pose_4":([_ for _ in CAMERA_DICT] + [""],{"default":""}),
+                "customize_R": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),
+                "customize_T": ("STRING", {"default": "[0.0, 0.0, 0.0]"}),
             }
 
         }
@@ -739,49 +725,53 @@ class VideoAcc_CameraTrajectoryAdvance:
     FUNCTION = "run"
     CATEGORY = "CameraCtrl"
 
-    def run(self, camera_pose, fx, fy, cx, cy, width, height, length, speed=1.0, speed_type="steady", initial_angle="[0.0, 0.0, 0.0]", initial_location="[0.0, 0.0, 0.0]",  zoom_factor=1.0):
+    def run(self, camera_pose, fx, fy, cx, cy, width, height, length, speed=1.0, speed_type="steady", initial_angle="[0.0, 0.0, 0.0]", initial_location="[0.0, 0.0, 0.0]",  zoom_factor=1.0, camera_pose_1="",camera_pose_2="",camera_pose_3="",camera_pose_4="",customize_R="[0.0, 0.0, 0.0]", customize_T="[0.0, 0.0, 0.0]",):
         """
         Use Camera trajectory as extrinsic parameters from ReCamMaster to calculate Plücker embeddings (Sitzmannet al., 2021)
         index from 1 to 10 represent: Pan Right, Pan Left, Tilt Up, Tilt Down, Zoom In, Zoom Out;
         Translate Up (with rotation), Translate Down (with rotation), Arc Left (with rotation), Arc Right (with rotation)
         https://github.com/KwaiVGI/ReCamMaster
         """
-        if camera_pose in ["orbit","dolly_zoom"]:
-            pass
-            # start_position = np.array(ast.literal_eval(start_position))
-            # end_position = np.array(ast.literal_eval(end_position))
+        camera_pose_list =[camera_pose]
+        for pose in [camera_pose_1, camera_pose_2, camera_pose_3, camera_pose_4]:
+            if len(pose) == 0:
+                break
+            camera_pose_list.append(pose)
 
-            # if camera_pose == "orbit":
-            #     RT = create_orbit_path(length, total_angle=total_angle,  radius=4.0, center=np.array([0, 1, 0]))
-            # elif camera_pose == "dolly_zoom":
-            #     RT = create_dolly_zoom_path(length, start_position, end_position)
-        else:
-            initial_angle = np.array(ast.literal_eval(initial_angle), dtype=np.float32)
-            initial_location = np.array(ast.literal_eval(initial_location), dtype=np.float32)
+        initial_angle = np.array(ast.literal_eval(initial_angle), dtype=np.float32)
+        initial_location = np.array(ast.literal_eval(initial_location), dtype=np.float32)
+        customize_R = np.array(ast.literal_eval(customize_R), dtype=np.float32)
+        customize_T = np.array(ast.literal_eval(customize_T), dtype=np.float32)
+
+        length_remain = 0
+        pose_compose = []
+        for idx, pose in enumerate(camera_pose_list):
+            if idx < len(camera_pose_list) -1:
+                target_length = length // len(camera_pose_list)
+            else:
+                target_length = length - length_remain
+            pose_compose += [pose for _ in range(target_length)]
+            length_remain += target_length
 
 
-            camera_dict = {
-                "motion":[camera_pose],
-                "mode": "Basic Camera Poses",  # "First A then B", "Both A and B", "Custom"
-                "speed": speed,
-                "complex": None
-                }
-            motion_list = camera_dict['motion']
-            speed = camera_dict['speed'] 
-            angle = np.array(CAMERA_DICT[motion_list[0]]["angle"])
-            T = np.array(CAMERA_DICT[motion_list[0]]["T"])
-            RT = get_camera_motion(angle, T, speed, length, speed_type=speed_type,
+            angle = np.array(CAMERA_DICT[pose]["angle"] if pose != "Customize" else customize_R)
+            T = np.array(CAMERA_DICT[pose]["T"] if pose != "Customize" else customize_T)
+            RT = get_camera_motion(angle, T, speed, target_length, speed_type=speed_type,
                 initial_angle=initial_angle,
                 initial_location=initial_location
             )
-        trajs=[]
-        for i, cp in enumerate(RT.tolist()):
-            if camera_pose == "Zoom In":
-                scale = 1.0 + (i / length) * zoom_factor   # progressively zoom in to 130%
-            elif camera_pose == "Zoom Out":
-                scale = 1.0 - (i / length) * zoom_factor   # progressively zoom out to 70%
+            if idx > 0:
+                RT_all = combine_camera_motion(RT_all, RT)
             else:
-                scale = 1.0
+                RT_all = RT
+                    
+        trajs=[]
+        scale = 1.0
+        for i, cp in enumerate(RT_all.tolist()):
+            if pose_compose[i] == "Zoom In":
+                scale += (1 / length) * zoom_factor   # progressively zoom in to 130%
+            elif pose_compose[i] == "Zoom Out":
+                scale -= (1 / length) * zoom_factor   # progressively zoom out to 70%
 
             traj=[scale * fx,scale * fy,cx,cy,0,0]
             traj.extend(cp[0])
