@@ -194,7 +194,11 @@ class Camera(object):
         self.fy = fy
         self.cx = cx
         self.cy = cy
-        c2w_mat = np.array(entry[7:]).reshape(4, 4)
+        if len(entry[7:]) == 12:
+            c2w_mat = np.eye(4)
+            c2w_mat[:3, :] = np.array(entry[7:]).reshape(3, 4)
+        else:
+            c2w_mat = np.array(entry[7:]).reshape(4, 4)
         self.c2w_mat = c2w_mat
         self.w2c_mat = np.linalg.inv(c2w_mat)
 
@@ -620,59 +624,71 @@ class VideoAcc_CameraTrajectoryRecam:
         return {
             "required": {
                 "cam_type":("INT",{"default":1, "min": 0, "max": 10, "step":1}),
-                "fx":("FLOAT",{"default":0.474812461, "min": 0, "max": 1, "step": 0.000000001}),
-                "fy":("FLOAT",{"default":0.844111024, "min": 0, "max": 1, "step": 0.000000001}),
+                "fx":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.000000001}),
+                "fy":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.000000001}),
                 "cx":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.01}),
                 "cy":("FLOAT",{"default":0.5, "min": 0, "max": 1, "step": 0.01}),
                 "width": ("INT", {"default": 832, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
                 "height": ("INT", {"default": 480, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
                 "length": ("INT", {"default": 81, "min": 1, "max": 81, "step": 4}),
             },
+            "optional":{
+                "customized_file": ("STRING", {"default": ""}),
+            }
         }
 
-    RETURN_TYPES = ("LATENT","INT","INT","INT")
-    RETURN_NAMES = ("WAN_CAMERA_EMBEDDING","width","height","length")
+    RETURN_TYPES = ("WAN_CAMERA_EMBEDDING","INT","INT","INT")
+    RETURN_NAMES = ("camera_embedding","width","height","length")
     FUNCTION = "run"
     CATEGORY = "CameraCtrl"
 
-    def run(self, cam_type, fx, fy, cx, cy, width, height,length):
+    def run(self, cam_type, fx, fy, cx, cy, width, height,length, customized_file = ""):
         """
         Use Camera trajectory as extrinsic parameters from ReCamMaster to calculate Plücker embeddings (Sitzmannet al., 2021)
         index from 1 to 10 represent: Pan Right, Pan Left, Tilt Up, Tilt Down, Zoom In, Zoom Out;
         Translate Up (with rotation), Translate Down (with rotation), Arc Left (with rotation), Arc Right (with rotation)
         https://github.com/KwaiVGI/ReCamMaster
+        support other customized files: https://github.com/hehao13/CameraCtrl/tree/main/assets/pose_files
         """
-        file_path = __file__
-        folder_path = os.path.dirname(file_path)
-        tgt_camera_path = os.path.join(folder_path,"camera_extrinsics.json")
-        # camera_extrinsics is from https://github.com/KwaiVGI/ReCamMaster/blob/main/example_test_data/cameras/camera_extrinsics.json
-        with open(tgt_camera_path, 'r') as file:
-            cam_data = json.load(file)
+        if customized_file == "":
+            file_path = __file__
+            folder_path = os.path.dirname(file_path)
+            tgt_camera_path = os.path.join(folder_path,"camera_extrinsics.json")
+            # camera_extrinsics is from https://github.com/KwaiVGI/ReCamMaster/blob/main/example_test_data/cameras/camera_extrinsics.json
+            with open(tgt_camera_path, 'r') as file:
+                cam_data = json.load(file)
 
-        interval = 80 // (length -1) 
-        cam_idx = list(range(81))[::interval]
-        assert len(cam_idx) == length, "Wrong video length"
+            interval = 80 // (length -1) 
+            cam_idx = list(range(81))[::interval]
+            assert len(cam_idx) == length, "Wrong video length"
 
-        traj = [parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type):02d}"]) for idx in cam_idx]
-        traj = np.stack(traj).transpose(0, 2, 1)
-        camera_pose_list = []
-        for c2w in traj:
-            c2w = c2w[:, [1, 2, 0, 3]]
-            c2w[:3, 1] *= -1.
-            c2w[:3, 3] /= 100
-            camera_pose_list.append(c2w)
-        trajs=[]
+            traj = [parse_matrix(cam_data[f"frame{idx}"][f"cam{int(cam_type):02d}"]) for idx in cam_idx]
+            traj = np.stack(traj).transpose(0, 2, 1)
+            camera_pose_list = []
+            for c2w in traj:
+                c2w = c2w[:, [1, 2, 0, 3]]
+                c2w[:3, 1] *= -1.
+                c2w[:3, 3] /= 100
+                camera_pose_list.append(c2w)
+            trajs=[]
 
-        for cp in camera_pose_list:
-            traj=[fx,fy,cx,cy,0,0]
-            traj.extend(cp[0])
-            traj.extend(cp[1])
-            traj.extend(cp[2])
-            traj.extend(cp[3])
-            trajs.append(traj)
+            for cp in camera_pose_list:
+                traj=[fx,fy,cx,cy,0,0]
+                traj.extend(cp[0])
+                traj.extend(cp[1])
+                traj.extend(cp[2])
+                traj.extend(cp[3])
+                trajs.append(traj)
 
-        cam_params = np.array([[float(x) for x in pose] for pose in trajs])
-        cam_params = np.concatenate([np.zeros_like(cam_params[:, :1]), cam_params], 1)
+            cam_params = np.array([[float(x) for x in pose] for pose in trajs])
+            cam_params = np.concatenate([np.zeros_like(cam_params[:, :1]), cam_params], 1)
+        else:
+            with open(customized_file, 'r') as f:
+                poses = f.readlines()
+            poses = [pose.strip().split(' ') for pose in poses[1:]]
+
+            cam_params = [[float(x) for x in poses[0]]] + [[float(x) for x in pose] for pose in poses]
+            length = len(cam_params)
         control_camera_video = process_pose_params(cam_params, width=width, height=height)
         control_camera_video = control_camera_video.permute([3, 0, 1, 2]).unsqueeze(0).to(device=comfy.model_management.intermediate_device())
 
